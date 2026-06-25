@@ -1,0 +1,122 @@
+name: Validate Traceability
+
+on:
+  pull_request:
+    types: [opened, reopened, synchronize, edited]
+
+permissions:
+  contents: read
+  issues: read
+
+jobs:
+  traceability-check:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Validate PB issue traceability
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const owner = context.repo.owner;
+            const repo = context.repo.repo;
+
+            const allIssues = await github.paginate(github.rest.issues.listForRepo, {
+              owner,
+              repo,
+              state: "all",
+              per_page: 100
+            });
+
+            const issues = allIssues.filter(i => !i.pull_request);
+            const byNumber = new Map(issues.map(i => [i.number, i]));
+            const pbIssues = issues.filter(i => /^PB-\d+:/.test(i.title || ""));
+
+            if (pbIssues.length === 0) {
+              core.setFailed("No PB-* issues found. Traceability cannot be validated.");
+              return;
+            }
+
+            const failures = [];
+
+            function parseLinkedNumbers(text, field) {
+              const re = new RegExp(`${field}:\\s*([^\\n]+)`, "i");
+              const m = text.match(re);
+              if (!m || !m[1]) return [];
+              return [...m[1].matchAll(/#(\d+)/g)].map(x => Number(x[1]));
+            }
+
+            function hasAcceptanceCriteria(body) {
+              if (!body) return false;
+              const section = body.match(/Acceptance Criteria:\s*([\s\S]*?)(?:\n[A-Z][A-Za-z ]+:\s|\n?$)/);
+              if (!section || !section[1]) return false;
+              return /-\s+/.test(section[1]);
+            }
+
+            function issueHasLabel(issue, labelName) {
+              return (issue.labels || []).some(l => {
+                if (typeof l === "string") return l === labelName;
+                return l.name === labelName;
+              });
+            }
+
+            for (const pb of pbIssues) {
+              const body = pb.body || "";
+              const pbId = pb.title.split(":")[0];
+
+              if (!hasAcceptanceCriteria(body)) {
+                failures.push(`${pbId} (#${pb.number}) is missing acceptance criteria.`);
+              }
+
+              const tcNumbers = parseLinkedNumbers(body, "Linked Test Case\\(s\\)");
+              if (tcNumbers.length === 0) {
+                failures.push(`${pbId} (#${pb.number}) does not have a linked test case.`);
+              } else {
+                for (const num of tcNumbers) {
+                  const tc = byNumber.get(num);
+                  if (!tc) {
+                    failures.push(`${pbId} (#${pb.number}) links missing test case #${num}.`);
+                    continue;
+                  }
+                  if (!issueHasLabel(tc, "test-case")) {
+                    failures.push(`${pbId} (#${pb.number}) links #${num}, but it is not labeled test-case.`);
+                  }
+                }
+              }
+
+              const evNumbers = parseLinkedNumbers(body, "Evidence Reference\\(s\\)");
+              if (evNumbers.length === 0) {
+                failures.push(`${pbId} (#${pb.number}) has no evidence reference.`);
+              } else {
+                for (const num of evNumbers) {
+                  const ev = byNumber.get(num);
+                  if (!ev) {
+                    failures.push(`${pbId} (#${pb.number}) links missing evidence issue #${num}.`);
+                    continue;
+                  }
+                  if (!issueHasLabel(ev, "evidence")) {
+                    failures.push(`${pbId} (#${pb.number}) links #${num}, but it is not labeled evidence.`);
+                  }
+                }
+              }
+
+              const statusLine = (body.match(/Status:\s*([^\n]+)/i) || [])[1] || "";
+              const doneLike = /\bdone\b/i.test(statusLine) || pb.state === "closed";
+              if (doneLike) {
+                if (evNumbers.length === 0) {
+                  failures.push(`${pbId} (#${pb.number}) is marked done/closed without evidence reference.`);
+                } else {
+                  const hasClosedEvidence = evNumbers.some(num => {
+                    const ev = byNumber.get(num);
+                    return ev && ev.state === "closed";
+                  });
+                  if (!hasClosedEvidence) {
+                    failures.push(`${pbId} (#${pb.number}) is marked done/closed but has no closed evidence issue.`);
+                  }
+                }
+              }
+            }
+
+            if (failures.length > 0) {
+              core.setFailed(`Traceability validation failed:\n- ${failures.join("\n- ")}`);
+            } else {
+              core.info(`Traceability validation passed for ${pbIssues.length} PB issues.`);
+            }
